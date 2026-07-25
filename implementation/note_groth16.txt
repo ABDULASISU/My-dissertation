@@ -1,0 +1,472 @@
+########################   groth16-main ##############################
+
+// =============================================================================
+// groth16-bench/src/main.rs
+//
+// Benchmark Groth16 sur la courbe BN254 (Ecosystème Arkworks).
+// Génère exactement 2^k contraintes R1CS pour une comparaison équitable.
+// =============================================================================
+
+use std::{
+    env,
+    time::{Duration, Instant},
+};
+
+use ark_bn254::{Bn254, Fr};
+use ark_ff::UniformRand;
+use ark_groth16::Groth16;
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+use ark_snark::SNARK;
+use rand::rngs::OsRng;
+
+// ── Circuit R1CS de Benchmark ────────────────────────────────────────────────
+struct MulBenchCircuit {
+    num_constraints: usize,
+    inputs: Vec<Option<Fr>>,
+}
+
+impl ConstraintSynthesizer<Fr> for MulBenchCircuit {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        // Variables de témoins (Witness)
+        for i in 0..self.num_constraints {
+            // Correction ici : passage par une fermeture explicite prenant un RNG
+            let val = self.inputs.get(i).cloned().flatten().unwrap_or_else(|| Fr::rand(&mut OsRng));
+            
+            let a = cs.new_witness_variable(|| Ok(val))?;
+            let b = cs.new_witness_variable(|| Ok(val))?;
+            let c = cs.new_witness_variable(|| Ok(val * val))?;
+            
+            // Enforce : a * b = c (1 contrainte R1CS par itération)
+            cs.enforce_constraint(ark_relations::r1cs::LinearCombination::from(a), b.into(), c.into())?;
+        }
+        Ok(())
+    }
+}
+
+// ── Utilitaires d'affichage ───────────────────────────────────────────────────
+fn fmt_d(d: Duration) -> String {
+    let s = d.as_secs_f64();
+    if s < 1.0 { format!("{:.1} ms", s * 1e3) } else { format!("{:.3} s", s) }
+}
+
+fn fmt_b(n: usize) -> String {
+    if n < 1024 { format!("{} B", n) }
+    else if n < 1 << 20 { format!("{:.2} KiB", n as f64 / 1024.0) }
+    else { format!("{:.2} MiB", n as f64 / (1024.0 * 1024.0)) }
+}
+
+fn bar(c: char, n: usize) { println!("{}", std::iter::repeat(c).take(n).collect::<String>()); }
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+fn main() {
+    let k: u32 = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(9);
+    let n_constraints = 1usize << k;
+
+    bar('═', 66);
+    println!("  BENCHMARK GROTH16 (Arkworks Ecosystem) — BN254");
+    bar('═', 66);
+    println!("  k = {}  →  Contraintes R1CS exactes = {}", k, n_constraints);
+    println!();
+
+    let mut timings: Vec<(&str, Duration)> = vec![];
+
+    // 1 & 3. Setup de confiance (Groth16 génère VK et PK en même temps)
+    bar('─', 66);
+    println!("[1/5] Génération du Setup Spécifique (Groth16 Setup) …");
+    let t = Instant::now();
+    
+    // Circuit vide pour le setup
+    let blank_circuit = MulBenchCircuit {
+        num_constraints: n_constraints,
+        inputs: vec![None; n_constraints],
+    };
+    
+    let mut rng = OsRng;
+    let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(blank_circuit, &mut rng).unwrap();
+    let d_setup = t.elapsed();
+    println!("  ✓ {}", fmt_d(d_setup));
+    timings.push(("Circuit Setup (PK/VK)", d_setup));
+
+    // 2. Génération du témoin
+    bar('─', 66);
+    println!("[2/5] Génération témoin …");
+    let t = Instant::now();
+    let witness_inputs: Vec<Option<Fr>> = (0..n_constraints).map(|_| Some(Fr::rand(&mut rng))).collect();
+    let circuit = MulBenchCircuit {
+        num_constraints: n_constraints,
+        inputs: witness_inputs,
+    };
+    let d_witness = t.elapsed();
+    println!("  ✓ {}", fmt_d(d_witness));
+    timings.push(("Génération témoin", d_witness));
+
+    // 4. Génération de la preuve
+    bar('─', 66);
+    println!("[4/5] Génération de la preuve (Groth16 Prove) …");
+    let t = Instant::now();
+    let proof = Groth16::<Bn254>::prove(&pk, circuit, &mut rng).unwrap();
+    let d_prove = t.elapsed();
+    
+    // Mesure de la taille de la preuve sérialisée
+    let mut proof_bytes = Vec::new();
+    ark_serialize::CanonicalSerialize::serialize_compressed(&proof, &mut proof_bytes).unwrap();
+    let plen = proof_bytes.len();
+    
+    println!("  ✓ {}  |  Taille : {}", fmt_d(d_prove), fmt_b(plen));
+    timings.push(("Génération preuve", d_prove));
+
+    // 5. Vérification
+    bar('─', 66);
+    println!("[5/5] Vérification de la preuve (Groth16 Verify) …");
+    let t = Instant::now();
+    
+    // Groth16 sans entrées publiques
+    let public_inputs: Vec<Fr> = vec![]; 
+    let is_valid = Groth16::<Bn254>::verify(&vk, &public_inputs, &proof).unwrap();
+    
+    assert!(is_valid, "VÉRIFICATION ÉCHOUÉE !");
+    let d_verify = t.elapsed();
+    println!("  ✓ VALIDE  {}", fmt_d(d_verify));
+    timings.push(("Vérification", d_verify));
+
+    // Résultats finaux
+    println!();
+    bar('═', 66);
+    println!("  RÉSULTATS FINAUX   k={k}");
+    bar('═', 66);
+    for (label, dur) in &timings {
+        println!("  {:<32} {:>10}", label, fmt_d(*dur));
+    }
+    println!("  {:<32} {:>10}", "Taille de la preuve", fmt_b(plen));
+    bar('═', 66);
+}
+
+
+############################# groth16-cargo ##########################
+
+
+[package]
+name    = "groth16-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-ff        = "0.4.0"
+ark-bn254     = "0.4.0"
+ark-groth16   = "0.4.0"
+ark-relations = "0.4.0"
+ark-snark     = "0.4.0"
+ark-serialize = "0.4.0"
+ark-std       = "0.4.0"
+rand          = "0.8"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"
+
+
+
+
+###################### result groth16-k=... ########################
+k=9
+
+
+Finished `release` profile [optimized] target(s) in 1m 55s                                         
+     Running `target\release\groth16-bench.exe 9`
+══════════════════════════════════════════════════════════════════
+  BENCHMARK GROTH16 (Arkworks Ecosystem) — BN254
+══════════════════════════════════════════════════════════════════
+  k = 9  →  Contraintes R1CS exactes = 512
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 175.4 ms
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 0.3 ms
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 108.0 ms  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  4.2 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=9
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)              175.4 ms
+  Génération témoin                    0.3 ms
+  Génération preuve                  108.0 ms
+  Vérification                         4.2 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\groth16_bench> 
+
+══════════════════════════════════════════════════════════════════
+  BENCHMARK GROTH16 (Arkworks Ecosystem) — BN254
+══════════════════════════════════════════════════════════════════
+  k = 13  →  Contraintes R1CS exactes = 8192
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 497.0 ms
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 4.4 ms
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 561.6 ms  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  3.5 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=13
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)              497.0 ms
+  Génération témoin                    4.4 ms
+  Génération preuve                  561.6 ms
+  Vérification                         3.5 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\groth16_bench> 
+
+     Running `target\release\groth16-bench.exe 17`
+══════════════════════════════════════════════════════════════════
+  BENCHMARK GROTH16 (Arkworks Ecosystem) — BN254
+══════════════════════════════════════════════════════════════════
+  k = 17  →  Contraintes R1CS exactes = 131072
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 6.953 s
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 71.8 ms
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 7.060 s  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  3.5 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=17
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)               6.953 s
+  Génération témoin                   71.8 ms
+  Génération preuve                   7.060 s
+  Vérification                         3.5 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+
+
+k=20
+
+    Finished `release` profile [optimized] target(s) in 2m 08s                                         
+     Running `target\release\groth16-bench.exe 20`
+══════════════════════════════════════════════════════════════════
+  BENCHMARK GROTH16 (Arkworks Ecosystem) — BN254
+══════════════════════════════════════════════════════════════════
+  k = 20  →  Contraintes R1CS exactes = 1048576
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 57.276 s
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 582.0 ms
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 53.460 s  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  5.4 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=20
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)              57.276 s
+  Génération témoin                  582.0 ms
+  Génération preuve                  53.460 s
+  Vérification                         5.4 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\groth16_bench> 
+
+══════════════════════════════════════════════════════════════════
+  k = 22  →  Contraintes R1CS exactes = 4194304
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 210.803 s
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 3.149 s
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 307.090 s  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  10.8 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=22
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)             210.803 s
+  Génération témoin                   3.149 s
+  Génération preuve                 307.090 s
+  Vérification                        10.8 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\groth16_bench> 
+
+
+#########################  BLS  ###################
+
+══════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════
+  k = 9  →  Contraintes R1CS exactes = 512
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 109.1 ms
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 0.3 ms
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 60.8 ms  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  3.7 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=9
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)              109.1 ms
+  Génération témoin                    0.3 ms
+  Génération preuve                   60.8 ms
+  Vérification                         3.7 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\groth16_bench> cargo run --release -- 13
+    Finished `release` profile [optimized] target(s) in 0.24s
+     Running `target\release\groth16-bench.exe 13`
+══════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════
+  k = 13  →  Contraintes R1CS exactes = 8192
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 597.5 ms
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 4.2 ms
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 450.5 ms  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  3.4 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=13
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)              597.5 ms
+  Génération témoin                    4.2 ms
+  Génération preuve                  450.5 ms
+  Vérification                         3.4 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\groth16_bench> cargo run --release -- 17
+    Finished `release` profile [optimized] target(s) in 0.21s
+     Running `target\release\groth16-bench.exe 17`
+══════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════
+  k = 17  →  Contraintes R1CS exactes = 131072
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 6.869 s
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 68.0 ms
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 6.316 s  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  3.8 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=17
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)               6.869 s
+  Génération témoin                   68.0 ms
+  Génération preuve                   6.316 s
+  Vérification                         3.8 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\groth16_bench> cargo run --release -- 20
+    Finished `release` profile [optimized] target(s) in 0.22s
+     Running `target\release\groth16-bench.exe 20`
+══════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════
+  k = 20  →  Contraintes R1CS exactes = 1048576
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 51.112 s
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 587.6 ms
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 46.939 s  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  3.6 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=20
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)              51.112 s
+  Génération témoin                  587.6 ms
+  Génération preuve                  46.939 s
+  Vérification                         3.6 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\groth16_bench> cargo run --release -- 22
+    Finished `release` profile [optimized] target(s) in 0.23s
+     Running `target\release\groth16-bench.exe 22`
+══════════════════════════════════════════════════════════════════
+  BENCHMARK GROTH16 (Arkworks Ecosystem) — BN254
+══════════════════════════════════════════════════════════════════
+  k = 22  →  Contraintes R1CS exactes = 4194304
+
+──────────────────────────────────────────────────────────────────
+[1/5] Génération du Setup Spécifique (Groth16 Setup) …
+  ✓ 191.306 s
+──────────────────────────────────────────────────────────────────
+[2/5] Génération témoin …
+  ✓ 2.280 s
+──────────────────────────────────────────────────────────────────
+[4/5] Génération de la preuve (Groth16 Prove) …
+  ✓ 189.060 s  |  Taille : 128 B
+──────────────────────────────────────────────────────────────────
+[5/5] Vérification de la preuve (Groth16 Verify) …
+  ✓ VALIDE  3.8 ms
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX   k=22
+══════════════════════════════════════════════════════════════════
+  Circuit Setup (PK/VK)             191.306 s
+  Génération témoin                   2.280 s
+  Génération preuve                 189.060 s
+  Vérification                         3.8 ms
+  Taille de la preuve                   128 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\groth16_bench> 
