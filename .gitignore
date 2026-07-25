@@ -1,0 +1,25 @@
+# LaTeX temporary files
+*.aux
+*.log
+*.toc
+*.out
+*.nav
+*.snm
+*.bbl
+*.bcf
+*.blg
+
+# Python
+__pycache__/
+*.pyc
+
+# Rust
+target/
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
