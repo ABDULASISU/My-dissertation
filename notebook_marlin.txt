@@ -1,0 +1,308 @@
+################################# main-marlin-BN254 ######################################
+
+use ark_bn254::{Bn254, Fr};
+use ark_ff::One;
+use ark_marlin::Marlin;
+use ark_poly_commit::marlin_pc::MarlinKZG10;
+use ark_relations::{
+    lc,
+    r1cs::{ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef, SynthesisError},
+};
+use ark_serialize::CanonicalSerialize; // Activé proprement grâce au Cargo.toml
+use ark_std::{env, time::{Duration, Instant}};
+use blake2::Blake2b;
+use rand::{rngs::OsRng, Rng};
+
+type MarlinBench = Marlin<Fr, MarlinKZG10<Bn254, ark_poly::univariate::DensePolynomial<Fr>>, Blake2b>;
+
+const DEFAULT_K: u32 = 12;
+
+struct MulBenchCircuit {
+    num_constraints: usize,
+    inputs: Vec<Fr>,
+}
+
+impl ConstraintSynthesizer<Fr> for MulBenchCircuit {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        let mut val = self.inputs.get(0).cloned().unwrap_or_else(Fr::one);
+        let mut last_var = cs.new_witness_variable(|| Ok(val))?;
+
+        for i in 1..self.num_constraints {
+            let next_val = self.inputs.get(i).cloned().unwrap_or_else(Fr::one);
+            let next_var = cs.new_witness_variable(|| Ok(next_val))?;
+            
+            val *= next_val;
+            let res_var = cs.new_witness_variable(|| Ok(val))?;
+
+            cs.enforce_constraint(lc!() + last_var, lc!() + next_var, lc!() + res_var)?;
+            last_var = res_var;
+        }
+
+        Ok(())
+    }
+}
+
+fn fmt_d(d: Duration) -> String {
+    let s = d.as_secs_f64();
+    if s < 1.0 { format!("{:.1} ms", s * 1e3) } else { format!("{:.3} s", s) }
+}
+
+fn bar(c: char, n: usize) {
+    println!("{}", std::iter::repeat(c).take(n).collect::<String>());
+}
+
+fn main() {
+    let k: u32 = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_K);
+    let n_cst  = 1usize << k;
+
+    // --- PRÉ-CALCULS / WITNESS ---
+    let t_witness = Instant::now();
+    let mut rng = OsRng;
+    let inputs: Vec<Fr> = (0..n_cst).map(|_| Fr::from(rng.gen::<u64>())).collect();
+    let circuit_index = MulBenchCircuit { num_constraints: n_cst, inputs: inputs.clone() };
+    let d_witness = t_witness.elapsed();
+
+    // EXTRACTION DU NOMBRE DE CONTRAINTES
+    let cs = ConstraintSystem::new_ref();
+    circuit_index.generate_constraints(cs.clone()).unwrap();
+    let exact_constraints = cs.num_constraints();
+
+    // On recrée le circuit propre pour l'indexation réelle
+    let circuit_index_real = MulBenchCircuit { num_constraints: n_cst, inputs: inputs.clone() };
+
+    // --- 1. SETUP SRS ---
+    let t_srs = Instant::now();
+    let max_degree = n_cst * 2; 
+    let srs = MarlinBench::universal_setup(max_degree, max_degree, max_degree, &mut rng)
+        .expect("Universal setup failed");
+    let d_srs = t_srs.elapsed();
+
+    // --- 2. KEYGEN VK & PK ---
+    let t_keygen = Instant::now();
+    let (pk, vk) = MarlinBench::index(&srs, circuit_index_real).expect("Indexing failed");
+    let d_keygen_total = t_keygen.elapsed();
+    
+    let t_vk = Instant::now();
+    let _vk_dummy = vk.clone();
+    let d_vk = t_vk.elapsed();
+    let d_pk = d_keygen_total.checked_sub(d_vk).unwrap_or(d_keygen_total);
+
+    // --- 3. PROVE ---
+    let circuit_to_prove = MulBenchCircuit { num_constraints: n_cst, inputs };
+    let t_prove = Instant::now();
+    let proof = MarlinBench::prove(&pk, circuit_to_prove, &mut rng).expect("Proving failed");
+    let d_prove = t_prove.elapsed();
+
+    // --- 4. TAILLE DE LA PREUVE ---
+    let mut serialized_proof = Vec::new();
+    proof.serialize(&mut serialized_proof)
+        .expect("Échec de la mesure de la taille de la preuve");
+    let proof_size = serialized_proof.len();
+
+    // --- 5. VERIFY ---
+    let t_verify = Instant::now();
+    let is_valid = MarlinBench::verify(&vk, &[], &proof, &mut rng).expect("Verification error");
+    let d_verify = t_verify.elapsed();
+
+    assert!(is_valid, "La vérification de la preuve a échoué !");
+
+    // --- AFFICHAGE STRICT DU TABLEAU DE RÉSULTATS ---
+    println!();
+    bar('═', 66);
+    println!("  FINAl RESULTS (MARLIN)  k={}   constraints ~= {}", k, exact_constraints);
+    bar('═', 66);
+    println!("  SRS setup                             {}", fmt_d(d_srs));
+    println!("  Witness generation                  {}", fmt_d(d_witness));
+    println!("  keygen_vk                          {}", fmt_d(d_vk));
+    println!("  keygen_pk                          {}", fmt_d(d_pk));
+    println!("  Proof generation                  {}", fmt_d(d_prove));
+    println!("  VVerification                       {}", fmt_d(d_verify));
+    println!("  Proof size                {} B", proof_size);
+    bar('═', 66);
+}
+
+
+
+
+############################## cargo marlin ########################################
+
+[package]
+name    = "marlin_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-ff           = "0.3"
+ark-ec           = "0.3"
+ark-poly         = "0.3"  # <--- AJOUTÉ ICI
+ark-relations    = "0.3"
+ark-std          = "0.3"
+ark-bn254        = "0.3" 
+ark-poly-commit  = "0.3"
+ark-marlin       = "0.3"
+rand             = "0.8"
+blake2           = "0.9"
+ark-serialize = "0.3"
+
+[profile.release]
+opt-level = 3
+
+
+
+#########################  results marlin_k=9,20 ####################################
+
+-commit v0.3.0
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target\release\marlin_bench.exe 9`
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX (MARLIN)  k=9   constraints ~= 511
+══════════════════════════════════════════════════════════════════
+  Setup SRS                          300.1 ms
+  Génération témoin                  0.5 ms
+  keygen_vk                          0.0 ms
+  keygen_pk                          575.5 ms
+  Génération preuve                  829.7 ms
+  Vérification                       16.6 ms
+  Taille de la preuve                743 B
+══════════════════════════════════════════════════════════════════
+
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\marlin_bench> cargo run --release -- 13
+warning: the following packages contain code that will be rejected by a future version of Rust: ark-poly-commit v0.3.0
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target\release\marlin_bench.exe 13`
+
+══════════════════════════════════════════════════════════════════
+  FINAl RESULTS (MARLIN)  k=13   constraints ~= 8191
+══════════════════════════════════════════════════════════════════
+  SRS setup                             534.9 ms
+  Witness generation                  1.8 ms
+  keygen_vk                          0.0 ms
+  keygen_pk                          707.2 ms
+  Proof generation                  1.939 s
+  VVerification                       5.7 ms
+  Proof size                743 B
+══════════════════════════════════════════════════════════════════
+
+
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target\release\marlin_bench.exe 17`
+
+══════════════════════════════════════════════════════════════════
+  FINAl RESULTS (MARLIN)  k=17   constraints ~= 131071
+══════════════════════════════════════════════════════════════════
+  SRS setup                             7.537 s
+  Witness generation                  19.9 ms
+  keygen_vk                          0.0 ms
+  keygen_pk                          9.991 s
+  Proof generation                  26.678 s
+  VVerification                       5.6 ms
+  Proof size                743 B
+══════════════════════════════════════════════════════════════════
+
+
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\plonk_bench> cargo run --release -- 20
+    Finished `release` profile [optimized] target(s) in 0.39s
+warning: the following packages contain code that will be rejected by a future version of Rust: ark-poly-commit v0.3.0
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target\release\marlin_bench.exe 20`
+
+══════════════════════════════════════════════════════════════════
+  RÉSULTATS FINAUX (MARLIN)  k=20   constraints ~= 1048575
+══════════════════════════════════════════════════════════════════
+  Setup SRS                          81.117 s
+  Génération témoin                  211.5 ms
+  keygen_vk                          0.0 ms
+  keygen_pk                          108.516 s
+  Génération preuve                  253.937 s
+  Vérification                       11.2 ms
+  Taille de la preuve                743 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\plonk_bench> 
+
+     Running `target\release\marlin_bench.exe 22`
+
+══════════════════════════════════════════════════════════════════
+  FINAl RESULTS (MARLIN)  k=22   constraints ~= 4194303
+══════════════════════════════════════════════════════════════════
+  SRS setup                             206.649 s
+  Witness generation                  617.9 ms
+  keygen_vk                          0.0 ms
+  keygen_pk                          306.913 s
+  Proof generation                  792.010 s
+  VVerification                       9.6 ms
+  Proof size                743 B
+══════════════════════════════════════════════════════════════════
+
+
+############################## marlin BLS ##########################################
+
+     Running `target\release\marlin_bench.exe 9`
+
+══════════════════════════════════════════════════════════════════
+  FINAL RESULTS (MARLIN - BLS12-381)  k=9   constraints ~= 511
+══════════════════════════════════════════════════════════════════
+  SRS setup                             85.3 ms
+  Witness generation                  0.5 ms
+  keygen_vk                          0.0 ms
+  keygen_pk                          163.0 ms
+  Proof generation                  528.3 ms
+  Verification                       10.5 ms
+  Proof size                951 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\marlin_bench> 
+
+     Running `target\release\marlin_bench.exe 13`
+
+══════════════════════════════════════════════════════════════════
+  FINAL RESULTS (MARLIN - BLS12-381)  k=13   constraints ~= 8191
+══════════════════════════════════════════════════════════════════
+  SRS setup                             925.8 ms
+  Witness generation                  1.8 ms
+  keygen_vk                          0.0 ms
+  keygen_pk                          1.080 s
+  Proof generation                  3.199 s
+  Verification                       17.9 ms
+  Proof size                951 B
+══════════════════════════════════════════════════════════════════
+PS C:\Users\abdul\desktop\abdul\abdul\blockchain\implemantation\marlin_bench> 
+
+══════════════════════════════════════════════════════════════════
+  FINAL RESULTS (MARLIN - BLS12-381)  k=17   constraints ~= 131071
+══════════════════════════════════════════════════════════════════
+  SRS setup                             12.185 s
+  Witness generation                  19.3 ms
+  keygen_vk                          0.0 ms
+  keygen_pk                          13.826 s
+  Proof generation                  42.855 s
+  Verification                       9.3 ms
+  Proof size                951 B
+    Finished `release` profile [optimized] target(s) in 0.25s
+
+
+══════════════════════════════════════════════════════════════════
+  FINAL RESULTS (MARLIN - BLS12-381)  k=21   constraints ~= 2097151
+══════════════════════════════════════════════════════════════════
+  SRS setup                             167.094 s
+  Witness generation                  308.5 ms
+  keygen_vk                          0.0 ms
+  keygen_pk                          217.648 s
+  Proof generation                  602.495 s
+  Verification                       10.3 ms
+  Proof size                951 B
+══════════════════════════════════════════════════════════════════
+
+
+══════════════════════════════════════════════════════════════════
+  FINAL RESULTS (MARLIN - BLS12-381)  k=22   constraints ~= 4194303
+══════════════════════════════════════════════════════════════════
+  SRS setup                             320.271 s
+  Witness generation                  626.6 ms
+  keygen_vk                          0.3 ms
+  keygen_pk                          426.429 s
+  Proof generation                  1216.963 s
+  Verification                       12.2 ms
+  Proof size                951 B
+══════════════════════════════════════════════════════════════════
+
+
